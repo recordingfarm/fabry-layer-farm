@@ -41,6 +41,87 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch (e) { /* diabaikan */ } }
 };
 
+// ════════════════════════════════════════════════════════
+// CACHE ANTARMUKA (stale-while-revalidate)
+// Halaman yang pernah dibuka tampil INSTAN dari cache, lalu disegarkan diam-diam
+// di latar belakang. Cache dihapus otomatis setiap ada perubahan data & saat logout.
+// ════════════════════════════════════════════════════════
+const RC = new Map();
+const RC_FRESH_MS = 15000;     // data lebih muda dari ini dianggap segar (tidak perlu cek server)
+const rcKey = (fn, args) => (App.user ? App.user.email : '?') + '|' + fn + '|' + JSON.stringify(args);
+function rcGet(k) {
+  let e = RC.get(k);
+  if (!e) {
+    const raw = store.get('rc:' + k);
+    if (raw) { try { e = JSON.parse(raw); RC.set(k, e); } catch (x) { e = null; } }
+  }
+  return e || null;
+}
+function rcSet(k, res) {
+  const e = { t: Date.now(), res: res };
+  RC.set(k, e);
+  if (store.get('agl_token')) store.set('rc:' + k, JSON.stringify(e));
+}
+function rcHas(fn, args) { return !!rcGet(rcKey(fn, args)); }
+function rcClear() {
+  RC.clear();
+  try { Object.keys(localStorage).filter(k => k.indexOf('rc:') === 0).forEach(k => localStorage.removeItem(k)); } catch (e) { /* abaikan */ }
+}
+const clone = o => JSON.parse(JSON.stringify(o));
+function typing() { const a = document.activeElement; return !!a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && !!a.closest('#app-container'); }
+
+/**
+ * Ambil data dengan cache. Ada cache -> kembalikan langsung (0 ms) & segarkan di latar belakang;
+ * onFresh dipanggil hanya jika isi dari server ternyata berbeda. Tidak ada cache -> tunggu server.
+ */
+async function swr(fn, args, onFresh) {
+  const k = rcKey(fn, args), e = rcGet(k);
+  if (e) {
+    if (Date.now() - e.t > RC_FRESH_MS) {
+      apiBg(fn, App.token, ...args).then(res => {
+        if (!res || !res.success) return;
+        const sama = JSON.stringify(res.data) === JSON.stringify(e.res.data);
+        rcSet(k, res);
+        if (!sama && onFresh) onFresh(clone(res));
+      }).catch(() => {});
+    }
+    return clone(e.res);
+  }
+  const res = await call(fn, App.token, ...args);
+  if (res) rcSet(k, res);
+  return res;
+}
+
+// Argumen baku tiap halaman (dipakai render & prefetch agar kunci cache sama)
+const inputDate = () => isOwner() ? (App.input.tanggal || hariIniWIB()) : hariIniWIB();
+const obatDate = () => isOwner() ? (App.obat.tanggal || hariIniWIB()) : hariIniWIB();
+const argsRiwayat = () => [{ hari: isOwner() ? App.riwayat.periode : 7, flok_id: App.riwayat.flok }];
+const argsDash = () => { const f = currentFlok(); return [{ flok_id: App.dash.flok || (f ? f.flok_id : ''), hari: App.dash.hari, groupBy: App.dash.groupBy }]; };
+
+/** Muat diam-diam halaman lain agar perpindahan menu terasa instan. */
+let warmTimer = null;
+function warm(delay) {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(async () => {
+    if (!App.user || !App.token) return;
+    const f = currentFlok();
+    const jobs = [];
+    if (f) {
+      jobs.push(['getInputContext', [f.flok_id, inputDate()]]);
+      jobs.push(['getObatContext', [f.flok_id, obatDate()]]);
+    }
+    jobs.push(['getRiwayat', argsRiwayat()]);
+    if (isOwner() || isAdmin()) jobs.push(['getDashboard', argsDash()]);
+    if (isOwner()) jobs.push(['getKelola', []]);
+    for (const j of jobs) {
+      if (!App.user) return;
+      const k = rcKey(j[0], j[1]), e = rcGet(k);
+      if (e && Date.now() - e.t < RC_FRESH_MS * 4) continue;
+      try { const r = await apiBg(j[0], App.token, ...j[1]); if (r && r.success) rcSet(k, r); } catch (x) { /* abaikan */ }
+    }
+  }, delay === undefined ? 400 : delay);
+}
+
 const nf0 = new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 });
 function fInt(n) { return (n === null || n === undefined || isNaN(n)) ? '-' : nf0.format(n); }
 function fDec(n, d) {
@@ -116,6 +197,7 @@ async function call(fn, ...args) {
   try {
     const res = await api(fn, ...args);
     if (!res || !res.success) { toast((res && res.message) || 'Terjadi kesalahan.', 'error'); return null; }
+    if (!/^get/.test(fn)) { rcClear(); warm(1500); }   // data berubah -> buang cache lama, isi ulang di latar belakang
     return res;
   } catch (e) {
     if (e && e.message === 'SESI_HABIS') return null;
@@ -248,7 +330,8 @@ async function doLogin(ev) {
     if (!res.success) { showLoginErr(res.message); return; }
     App.token = res.data.token;
     if (remember) store.set('agl_token', App.token); else store.del('agl_token');
-    await enterApp();
+    if (res.data.boot && res.data.boot.user) { saveBoot(res.data.boot); applyBootstrap(res.data.boot); showShell(); }
+    else await enterApp();
   } catch (e) {
     showLoginErr('Tidak dapat terhubung ke server. Periksa koneksi internet Anda.');
   } finally {
@@ -256,7 +339,40 @@ async function doLogin(ev) {
   }
 }
 
-async function enterApp() {
+function saveBoot(d) { if (store.get('agl_token')) store.set('agl_boot', JSON.stringify({ token: App.token, data: d })); }
+function applyBootstrap(d) {
+  App.user = d.user; App.config = d.config; App.floks = d.floks; App.petugas = d.petugas;
+}
+function showShell() {
+  $('#loginView').hidden = true;
+  $('#loginView').innerHTML = '';
+  $('#appShell').hidden = false;
+  buildShell();
+  navigateTo((isOwner() || isAdmin()) ? 'dashboard' : 'input');
+  warm(600);
+}
+
+/** Masuk ke aplikasi. fromCache=true: tampil seketika dari data tersimpan, lalu disegarkan diam-diam. */
+async function enterApp(fromCache) {
+  if (fromCache) {
+    const raw = store.get('agl_boot');
+    if (raw) {
+      try {
+        const b = JSON.parse(raw);
+        if (b && b.token === App.token && b.data && b.data.user) {
+          applyBootstrap(b.data);
+          showShell();
+          apiBg('getBootstrap', App.token).then(res => {
+            if (!res || !res.success) return;
+            saveBoot(res.data);
+            applyBootstrap(res.data);
+            renderHeader();
+          }).catch(() => {});
+          return;
+        }
+      } catch (e) { /* cache rusak, lanjut ke server */ }
+    }
+  }
   const res = await api('getBootstrap', App.token);
   if (!res.success) {
     App.token = null;
@@ -264,25 +380,22 @@ async function enterApp() {
     renderLogin(res.message === 'SESI_HABIS' ? '' : res.message);
     return;
   }
-  const d = res.data;
-  App.user = d.user; App.config = d.config; App.floks = d.floks; App.petugas = d.petugas;
-  $('#loginView').hidden = true;
-  $('#loginView').innerHTML = '';
-  $('#appShell').hidden = false;
-  buildShell();
-  navigateTo((isOwner() || isAdmin()) ? 'dashboard' : 'input');
+  saveBoot(res.data);
+  applyBootstrap(res.data);
+  showShell();
 }
 
 async function refreshBootstrap() {
   const res = await call('getBootstrap', App.token);
   if (!res) return;
-  const d = res.data;
-  App.user = d.user; App.config = d.config; App.floks = d.floks; App.petugas = d.petugas;
+  saveBoot(res.data);
+  applyBootstrap(res.data);
   renderHeader();
 }
 
 function resetAppState() {
   destroyCharts();
+  rcClear(); store.del('agl_boot');
   App.floks = []; App.config = {}; App.petugas = []; App.flokId = null; App.page = null;
   App.input = { tanggal: null, ctx: null, form: null };
   App.obat = { tanggal: null, ctx: null, form: null };
@@ -377,14 +490,19 @@ async function renderInput() {
   const c = $('#app-container');
   const flok = currentFlok();
   if (!flok) { c.innerHTML = emptyFlokHtml(); return; }
-  c.innerHTML = skeleton();
   if (!App.input.form) resetInputForm();
-  App.input.tanggal = isOwner() ? (App.input.tanggal || hariIniWIB()) : hariIniWIB();
-  const res = await call('getInputContext', App.token, flok.flok_id, App.input.tanggal);
+  App.input.tanggal = inputDate();
+  const args = [flok.flok_id, App.input.tanggal];
+  if (!rcHas('getInputContext', args)) c.innerHTML = skeleton();
+  const apply = r => { App.input.ctx = r.data; syncFlok(r.data.flok); };
+  const res = await swr('getInputContext', args, r => {
+    if (seq !== App.seq) return;
+    apply(r);
+    if (!typing()) paintInput();
+  });
   if (seq !== App.seq) return;
   if (!res) { c.innerHTML = errorCard('Gagal memuat form input.', 'renderInput()'); return; }
-  App.input.ctx = res.data;
-  syncFlok(res.data.flok);
+  apply(res);
   paintInput();
 }
 
@@ -612,19 +730,34 @@ function submitInput() {
       ['Deplesi', (mati + afkir) + ' ekor (mati ' + mati + ', afkir ' + afkir + ')'], ['Pakan', fDec(pakan, 1) + ' kg']
     ],
     okText: 'Ya, Simpan',
-    onOk: async () => {
+    onOk: () => {
       const payload = {
         flok_id: ctx.flok.flok_id, tanggal: isOwner() ? ctx.tanggal : '',
         deplesi_mati: mati, deplesi_afkir: afkir, pakan_kg: pakan, telur_butir: telur,
         telur_kg: kgFinal, catatan: $('#f_catatan').value.trim()
       };
-      const res = await call('simpanCatatanHarian', App.token, payload);
-      if (!res) return;
+      // OPTIMISTIC UI: langsung tampil "tersimpan" (0 ms), kirim ke server di latar belakang.
       closeSheet();
-      toast(res.message, 'success');
-      syncFlok(res.data.flok);
-      resetInputForm();
-      renderInput();
+      ctx.rec = {
+        catatan_id: 'tmp', tanggal: ctx.tanggal, deplesi_mati: mati, deplesi_afkir: afkir, pakan_kg: pakan,
+        telur_butir: telur, telur_kg: kgFinal, berat_telur_rata2_gram: beratFinal, catatan: payload.catatan,
+        diinput_oleh: App.user.email, waktu_input: hariIniWIB() + ' ' + jamWIB() + ':00'
+      };
+      toast('Rekap harian tersimpan.', 'success');
+      paintInput();
+      call('simpanCatatanHarian', App.token, payload).then(res => {
+        if (!res) {                       // gagal: kembalikan form dengan isian yang sama
+          ctx.rec = null;
+          if (App.input.ctx === ctx) paintInput();
+          toast('Rekap belum tersimpan. Data Anda masih ada di form, silakan coba lagi.', 'error');
+          return;
+        }
+        syncFlok(res.data.flok);
+        ctx.flok = res.data.flok;
+        if (ctx.rec) ctx.rec.catatan_id = res.data.catatan_id;
+        resetInputForm();
+        if (App.input.ctx === ctx) paintInput();
+      });
     }
   });
 }
@@ -653,14 +786,19 @@ async function renderObat() {
   const c = $('#app-container');
   const flok = currentFlok();
   if (!flok) { c.innerHTML = emptyFlokHtml(); return; }
-  c.innerHTML = skeleton();
   if (!App.obat.form) resetObatForm('VAKSIN');
-  App.obat.tanggal = isOwner() ? (App.obat.tanggal || hariIniWIB()) : hariIniWIB();
-  const res = await call('getObatContext', App.token, flok.flok_id, App.obat.tanggal);
+  App.obat.tanggal = obatDate();
+  const args = [flok.flok_id, App.obat.tanggal];
+  if (!rcHas('getObatContext', args)) c.innerHTML = skeleton();
+  const apply = r => { App.obat.ctx = r.data; syncFlok(r.data.flok); };
+  const res = await swr('getObatContext', args, r => {
+    if (seq !== App.seq) return;
+    apply(r);
+    if (!typing()) paintObat();
+  });
   if (seq !== App.seq) return;
   if (!res) { c.innerHTML = errorCard('Gagal memuat form obat & vaksin.', 'renderObat()'); return; }
-  App.obat.ctx = res.data;
-  syncFlok(res.data.flok);
+  apply(res);
   paintObat();
 }
 
@@ -787,16 +925,22 @@ function submitObat() {
       ['Produk', F.nama.trim()], ['Metode', F.metode], ['Dosis', fDec(k.dosis, 1) + ' dosis / ekor'],
       ['Kebutuhan flok', '~' + fInt(k.need) + ' dosis'], ['Waktu', cap(F.waktu)], ['Petugas', F.petugas]
     ],
-    onOk: async () => {
-      const res = await call('simpanObatVaksin', App.token, {
+    onOk: () => {
+      const payload = {
         flok_id: ctx.flok.flok_id, tanggal: isOwner() ? ctx.tanggal : '', jenis: F.jenis, nama_produk: F.nama.trim(),
         metode: F.metode, dosis_per_ekor: k.dosis, waktu: F.waktu, petugas: F.petugas, catatan: F.catatan.trim()
-      });
-      if (!res) return;
+      };
+      const snapshot = JSON.parse(JSON.stringify(F));
       closeSheet();
-      toast(res.message, 'success');
+      toast('Catatan ' + (F.jenis === 'VAKSIN' ? 'vaksinasi' : 'obat') + ' tersimpan.', 'success');
       resetObatForm(F.jenis);
-      renderObat();
+      paintObat();
+      call('simpanObatVaksin', App.token, payload).then(res => {
+        if (res) { apiBg('getObatContext', App.token, ctx.flok.flok_id, App.obat.tanggal).then(r => { if (r && r.success) { App.obat.ctx = r.data; syncFlok(r.data.flok); if (!typing()) paintObat(); } }).catch(() => {}); return; }
+        App.obat.form = snapshot;           // gagal: pulihkan isian agar tidak perlu mengetik ulang
+        if (App.page === 'obat') paintObat();
+        toast('Catatan belum tersimpan. Isian dikembalikan, silakan coba lagi.', 'error');
+      });
     }
   });
 }
@@ -808,9 +952,14 @@ function submitObat() {
 async function renderRiwayat() {
   const seq = App.seq;
   const c = $('#app-container');
-  c.innerHTML = skeleton();
   const R = App.riwayat;
-  const res = await call('getRiwayat', App.token, { hari: isOwner() ? R.periode : 7, flok_id: R.flok });
+  const args = argsRiwayat();
+  if (!rcHas('getRiwayat', args)) c.innerHTML = skeleton();
+  const res = await swr('getRiwayat', args, r => {
+    if (seq !== App.seq) return;
+    R.data = r.data;
+    if (!typing()) paintRiwayat();
+  });
   if (seq !== App.seq) return;
   if (!res) { c.innerHTML = errorCard('Gagal memuat riwayat.', 'renderRiwayat()'); return; }
   R.data = res.data;
@@ -946,9 +1095,15 @@ function destroyCharts() {
 async function renderDashboard() {
   const seq = App.seq;
   const c = $('#app-container');
-  c.innerHTML = skeleton();
   const D = App.dash;
-  const res = await call('getDashboard', App.token, { flok_id: D.flok, hari: D.hari, groupBy: D.groupBy });
+  if (!D.flok) { const f0 = currentFlok(); if (f0) D.flok = f0.flok_id; }
+  const args = argsDash();
+  if (!rcHas('getDashboard', args)) c.innerHTML = skeleton();
+  const res = await swr('getDashboard', args, r => {
+    if (seq !== App.seq) return;
+    D.data = r.data; D.flok = r.data.flok.flok_id;
+    paintDashboard();
+  });
   if (seq !== App.seq) return;
   if (!res) { c.innerHTML = errorCard('Gagal memuat dashboard.', 'renderDashboard()'); return; }
   D.data = res.data;
@@ -1095,8 +1250,12 @@ function drawCharts(d) {
 async function renderKelola() {
   const seq = App.seq;
   const c = $('#app-container');
-  c.innerHTML = skeleton();
-  const res = await call('getKelola', App.token);
+  if (!rcHas('getKelola', [])) c.innerHTML = skeleton();
+  const res = await swr('getKelola', [], r => {
+    if (seq !== App.seq) return;
+    App.kelola.data = r.data;
+    if (!typing()) paintKelola();
+  });
   if (seq !== App.seq) return;
   if (!res) { c.innerHTML = errorCard('Gagal memuat menu Kelola.', 'renderKelola()'); return; }
   App.kelola.data = res.data;
@@ -1371,7 +1530,7 @@ function renderProfil() {
     '<label class="lbl" for="p_ulang">Ulangi PIN Baru</label><input id="p_ulang" class="input" type="password" inputmode="numeric" maxlength="8" autocomplete="new-password">' +
     '<button class="btn btn-primary btn-block" id="p_save" style="margin-top:16px" onclick="savePin()">Ganti PIN</button></section>' +
     '<button class="btn btn-soft btn-block" onclick="logout()"><i class="bi bi-box-arrow-right"></i> Keluar</button>' +
-    '<p class="foot-note">Fabry Layer Farm SIM v2.0 • Zona waktu WIB</p>';
+    '<p class="foot-note">Fabry Layer Farm SIM v2.1 • Zona waktu WIB</p>';
 }
 async function savePin() {
   const lama = $('#p_lama').value.trim(), baru = $('#p_baru').value.trim(), ulang = $('#p_ulang').value.trim();
@@ -1404,7 +1563,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const t = store.get('agl_token');
   if (t) {
     App.token = t;
-    try { await enterApp(); } catch (e) { if ($('#loginView').hidden) renderLogin(); }
+    try { await enterApp(true); } catch (e) { if ($('#loginView').hidden) renderLogin(); }
   } else {
     renderLogin();
   }

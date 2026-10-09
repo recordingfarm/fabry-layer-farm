@@ -182,3 +182,9 @@ Tunggu 1–2 menit, lalu **Ctrl+Shift+R**.
 - **Branch `main`**: jalur utama proyek.
 - **GitHub Pages**: layanan gratis GitHub untuk menayangkan situs statis.
 - **Web App URL (`/exec`)**: alamat backend Apps Script.
+
+## Catatan kecepatan (v2.1)
+- Halaman yang pernah dibuka tampil langsung dari cache, lalu disegarkan diam-diam. Menu lain dimuat otomatis di latar belakang.
+- Tombol Simpan langsung menampilkan "tersimpan"; pengiriman ke server berjalan di belakang. Jika gagal, isian dikembalikan ke form.
+- Backend menyimpan hasil baca di CacheService dan otomatis dibersihkan setiap ada data berubah. Bila Anda mengedit Google Sheet **langsung** (bukan lewat aplikasi), tampilan bisa tertinggal hingga ±10 menit.
+- Setelah mengganti `Kode.gs`: Deploy → Manage deployments → Edit → New version.

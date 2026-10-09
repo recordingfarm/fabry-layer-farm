@@ -6,17 +6,18 @@
 // ============================================================
 const API_TIMEOUT_MS = 60000;
 
-function api(fn) {
-  const args = Array.prototype.slice.call(arguments, 1);
-  // Konvensi lama: argumen pertama adalah token (kecuali loginPin).
-  const token = fn === 'loginPin' ? '' : String(args.shift() || '');
-  busy(1);
+function gasUrlOk() {
+  return typeof GAS_URL === 'string' && GAS_URL.indexOf('https://script.google.com/') === 0;
+}
 
-  if (!GAS_URL || GAS_URL.indexOf('https://script.google.com/') !== 0) {
-    busy(-1);
+function post(fn, args, quiet) {
+  // Konvensi: argumen pertama adalah token (kecuali loginPin).
+  const token = fn === 'loginPin' ? '' : String(args.shift() || '');
+  if (!quiet) busy(1);
+  if (!gasUrlOk()) {
+    if (!quiet) busy(-1);
     return Promise.reject(new Error('GAS_URL belum diisi di js/config.js'));
   }
-
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
   return fetch(GAS_URL, {
@@ -34,5 +35,17 @@ function api(fn) {
       }
       return res;
     })
-    .finally(() => { clearTimeout(timer); busy(-1); });
+    .finally(() => { clearTimeout(timer); if (!quiet) busy(-1); });
 }
+
+/** Panggilan biasa (menampilkan bilah progres di atas). */
+function api(fn) { return post(fn, Array.prototype.slice.call(arguments, 1), false); }
+/** Panggilan latar belakang (tanpa bilah progres) untuk prefetch & penyegaran diam-diam. */
+function apiBg(fn) { return post(fn, Array.prototype.slice.call(arguments, 1), true); }
+
+/** "Bangunkan" Apps Script begitu halaman terbuka, agar login/permintaan pertama tidak kena cold start. */
+function wakeBackend() {
+  if (!gasUrlOk()) return;
+  try { fetch(GAS_URL, { method: 'GET', mode: 'no-cors', cache: 'no-store' }).catch(() => {}); } catch (e) { /* abaikan */ }
+}
+wakeBackend();
